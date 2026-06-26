@@ -18,6 +18,16 @@ GROUND_TRUTH_PATH = Path("bogor_daily_waste_ground_truth_2025.csv")
 MODEL_NAME = "Gradient Boosting Regressor"
 RANDOM_STATE = 42
 
+# --- KONFIGURASI WARNA KONSISTEN ---
+WASTE_COLORS = {
+    "Total": "#7c3aed",  # Ungu
+    "Organik": "#10b981",  # Hijau Emerald
+    "Anorganik": "#eab308"  # Kuning
+}
+
+# Palet aman untuk 6 kecamatan
+KECAMATAN_COLORS = ["#10b981", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#ea580c"]
+
 EVENT_MULTIPLIERS = {
     "normal": 1.00,
     "ramadan": 1.05,
@@ -79,16 +89,19 @@ WASTE_VIEW_OPTIONS = {
         "history_column": "total_tons",
         "forecast_column": "prediksi_total_ton",
         "label": "Total sampah",
+        "color": WASTE_COLORS["Total"]
     },
     "Organik": {
         "history_column": "organic_tons",
         "forecast_column": "prediksi_organik_ton",
         "label": "Sampah organik",
+        "color": WASTE_COLORS["Organik"]
     },
     "Anorganik": {
         "history_column": "inorganic_tons",
         "forecast_column": "prediksi_anorganik_ton",
         "label": "Sampah anorganik",
+        "color": WASTE_COLORS["Anorganik"]
     },
 }
 
@@ -96,7 +109,7 @@ st.markdown(
     """
     <style>
     .block-container {max-width: 1440px; padding-top: 1.35rem; padding-bottom: 2rem;}
-    [data-testid="stMetric"] {border-top: 2px solid #167a58; padding-top: .65rem;}
+    [data-testid="stMetric"] {border-top: 2px solid #7c3aed; padding-top: .65rem;}
     [data-testid="stMetricLabel"] {font-size: .82rem;}
     .stTabs [data-baseweb="tab-list"] {gap: 1.25rem;}
     .stTabs [data-baseweb="tab"] {padding-left: 0; padding-right: 0;}
@@ -245,11 +258,16 @@ def regression_metrics(actual, predicted) -> dict:
     actual = np.asarray(actual)
     predicted = np.asarray(predicted)
     nonzero = np.abs(actual) > 1e-9
+
+    mape = np.mean(np.abs((actual[nonzero] - predicted[nonzero]) / actual[nonzero])) * 100 if np.sum(
+        nonzero) > 0 else 0.0
+    r2 = r2_score(actual, predicted) if len(actual) >= 2 else np.nan
+
     return {
         "MAE": mean_absolute_error(actual, predicted),
         "RMSE": mean_squared_error(actual, predicted) ** 0.5,
-        "MAPE (%)": np.mean(np.abs((actual[nonzero] - predicted[nonzero]) / actual[nonzero])) * 100,
-        "R2": r2_score(actual, predicted),
+        "MAPE (%)": mape,
+        "R2": r2,
     }
 
 
@@ -286,6 +304,13 @@ def forecast_target(frame: pd.DataFrame, days: int, target_column: str, output_c
     model_df = add_features(frame, target_column)
     model = build_model()
     model.fit(model_df[FEATURES], model_df[target_column])
+
+    hist_df = model_df[["date", "kecamatan", target_column, "synthetic_event"]].copy()
+    hist_df[output_column] = np.maximum(0, model.predict(model_df[FEATURES]))
+    hist_df["tipe_data"] = "Historis"
+    hist_df["kejadian"] = hist_df["synthetic_event"].map(EVENT_LABELS)
+    hist_df = hist_df.drop(columns=["synthetic_event"])
+
     last_date = frame["date"].max()
     future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=days)
     history = {
@@ -325,11 +350,15 @@ def forecast_target(frame: pd.DataFrame, days: int, target_column: str, output_c
                 {
                     "date": date,
                     "kecamatan": district,
+                    target_column: np.nan,
                     output_column: prediction,
+                    "tipe_data": "Prediksi",
                     "kejadian": EVENT_LABELS.get(event, event),
                 }
             )
-    return pd.DataFrame(rows)
+
+    future_df = pd.DataFrame(rows)
+    return pd.concat([hist_df, future_df], ignore_index=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -337,29 +366,33 @@ def forecast_future(frame: pd.DataFrame, days: int) -> pd.DataFrame:
     total = forecast_target(frame, days, "total_tons", "prediksi_total_ton")
     organic = forecast_target(frame, days, "organic_tons", "prediksi_organik_ton")
     inorganic = forecast_target(frame, days, "inorganic_tons", "prediksi_anorganik_ton")
+
+    merge_cols = ["date", "kecamatan", "tipe_data", "kejadian"]
     forecast = total.merge(
-        organic[["date", "kecamatan", "prediksi_organik_ton"]],
-        on=["date", "kecamatan"],
-        how="left",
+        organic[merge_cols + ["organic_tons", "prediksi_organik_ton"]], on=merge_cols, how="left"
     ).merge(
-        inorganic[["date", "kecamatan", "prediksi_anorganik_ton"]],
-        on=["date", "kecamatan"],
-        how="left",
+        inorganic[merge_cols + ["inorganic_tons", "prediksi_anorganik_ton"]], on=merge_cols, how="left"
     )
     return forecast
 
 
-def line_chart(data, x, y, color=None, title=None, height=360):
+def line_chart(data, x, y, color_col=None, title=None, height=360, color_scale=None, single_color="#7c3aed"):
     encoding = {
         "x": alt.X(f"{x}:T", title=None),
         "y": alt.Y(f"{y}:Q", title="Ton"),
         "tooltip": [alt.Tooltip(f"{x}:T", format="%Y-%m-%d"), alt.Tooltip(f"{y}:Q", format=",.2f")],
     }
-    if color:
-        encoding["color"] = alt.Color(f"{color}:N", title=None)
-        encoding["tooltip"].insert(0, alt.Tooltip(f"{color}:N"))
-    return alt.Chart(data).mark_line(strokeWidth=2).encode(**encoding).properties(title=title,
-                                                                                  height=height).interactive()
+    if color_col:
+        if color_scale:
+            encoding["color"] = alt.Color(f"{color_col}:N", title=None, scale=color_scale)
+        else:
+            encoding["color"] = alt.Color(f"{color_col}:N", title=None)
+        encoding["tooltip"].insert(0, alt.Tooltip(f"{color_col}:N"))
+        chart = alt.Chart(data).mark_line(strokeWidth=2)
+    else:
+        chart = alt.Chart(data).mark_line(strokeWidth=2, color=single_color)
+
+    return chart.encode(**encoding).properties(title=title, height=height).interactive()
 
 
 def circle_polygon(latitude, longitude, radius_m, points=72):
@@ -396,8 +429,8 @@ def radius_map(frame: pd.DataFrame):
         "PolygonLayer",
         data=map_data,
         get_polygon="polygon",
-        get_fill_color=[22, 122, 88, 55],
-        get_line_color=[14, 92, 65, 220],
+        get_fill_color=[124, 58, 237, 55],
+        get_line_color=[124, 58, 237, 220],
         line_width_min_pixels=2,
         stroked=True,
         filled=True,
@@ -455,13 +488,12 @@ if filtered.empty:
     st.stop()
 
 with st.spinner("Menyiapkan hasil akhir model..."):
-    # PERUBAHAN UTAMA: Memasukkan `filtered` ke dalam proses model dan prediksi
-    # agar model hanya dilatih dan diprediksi untuk subset data yang ada di sidebar.
     backtest, test_metrics = run_final_model(filtered)
     future = forecast_future(filtered, horizon)
+    future_filtered = future[future["kecamatan"].isin(selected_districts)]
 
-ringkasan_tab, komposisi_tab, prediksi_tab, kinerja_tab, data_tab = st.tabs(
-    ["Ringkasan", "Komposisi", "Prediksi", "Kinerja", "Data"]
+ringkasan_tab, komposisi_tab, prediksi_tab, kinerja_tab, detail_tab, data_tab = st.tabs(
+    ["Ringkasan", "Komposisi", "Prediksi", "Kinerja", "Detail Harian", "Data"]
 )
 
 with ringkasan_tab:
@@ -486,7 +518,8 @@ with ringkasan_tab:
         columns={summary_config["history_column"]: "tons"}
     )
     st.altair_chart(
-        line_chart(daily_plot, "date", "tons", None, f"Tren harian {summary_config['label'].lower()}", 370),
+        line_chart(daily_plot, "date", "tons", None, f"Tren harian {summary_config['label'].lower()}", 370,
+                   single_color=summary_config["color"]),
         width="stretch",
     )
 
@@ -494,7 +527,7 @@ with ringkasan_tab:
     district_summary = filtered.groupby("kecamatan", as_index=False)["total_tons"].sum().sort_values("total_tons")
     district_chart = (
         alt.Chart(district_summary)
-        .mark_bar(color="#167a58")
+        .mark_bar(color=WASTE_COLORS["Total"])
         .encode(
             x=alt.X("total_tons:Q", title="Total tahunan (ton)"),
             y=alt.Y("kecamatan:N", sort=None, title=None),
@@ -522,7 +555,9 @@ with komposisi_tab:
         .encode(
             x=alt.X("bulan:N", title=None),
             y=alt.Y("tons:Q", title="Ton"),
-            color=alt.Color("jenis:N", title=None, scale=alt.Scale(range=["#18a875", "#f0a329"])),
+            color=alt.Color("jenis:N", title=None, scale=alt.Scale(domain=["Organik", "Anorganik"],
+                                                                   range=[WASTE_COLORS["Organik"],
+                                                                          WASTE_COLORS["Anorganik"]])),
             tooltip=["bulan", "jenis", alt.Tooltip("tons:Q", format=",.0f")],
         )
         .properties(title="Komposisi sampah bulanan", height=360)
@@ -542,7 +577,7 @@ with komposisi_tab:
     weekday = weekday.sort_values("hari")
     c1.altair_chart(
         alt.Chart(weekday)
-        .mark_bar(color="#315f9d")
+        .mark_bar(color=WASTE_COLORS["Total"])
         .encode(
             x=alt.X("hari:N", sort=order, title=None),
             y=alt.Y("total_tons:Q", title="Rata-rata ton"),
@@ -560,7 +595,7 @@ with komposisi_tab:
     event_average["synthetic_event"] = event_average["synthetic_event"].map(EVENT_LABELS)
     c2.altair_chart(
         alt.Chart(event_average)
-        .mark_bar(color="#a15364")
+        .mark_bar(color=WASTE_COLORS["Total"])
         .encode(
             x=alt.X("total_tons:Q", title="Rata-rata ton"),
             y=alt.Y("synthetic_event:N", sort=None, title=None),
@@ -581,9 +616,10 @@ with prediksi_tab:
     st.caption(
         "Prediksi total, organik, dan anorganik dihitung oleh tiga model terpisah, bukan dari pembagian proporsi total.")
 
-    # 1. Grafik Agregat
+    future_pred_only = future_filtered[future_filtered["tipe_data"] == "Prediksi"]
+
     st.subheader("Prediksi Agregat")
-    city_future = future.groupby("date", as_index=False)[prediction_config["forecast_column"]].sum()
+    city_future = future_pred_only.groupby("date", as_index=False)[prediction_config["forecast_column"]].sum()
     history = (
         filtered.groupby("date", as_index=False)[prediction_config["history_column"]]
         .sum()
@@ -596,11 +632,12 @@ with prediksi_tab:
     combined = pd.concat([history, future_plot], ignore_index=True)
     st.altair_chart(
         line_chart(combined, "date", "tons", "seri",
-                   f"Prediksi {prediction_config['label'].lower()} untuk {horizon} hari ke depan", 350),
+                   f"Prediksi {prediction_config['label'].lower()} untuk {horizon} hari ke depan", 350,
+                   color_scale=alt.Scale(domain=["Historis", "Prediksi"],
+                                         range=[prediction_config["color"], "#a8a29e"])),
         width="stretch",
     )
 
-    # 2. Grafik Detail per Kecamatan
     st.subheader("Prediksi per Kecamatan")
     cutoff_date = filtered["date"].max() - pd.Timedelta(days=21)
 
@@ -609,7 +646,7 @@ with prediksi_tab:
     dist_history.rename(columns={prediction_config["history_column"]: "tons"}, inplace=True)
     dist_history["Keterangan"] = "Historis"
 
-    dist_future = future[["date", "kecamatan", prediction_config["forecast_column"]]].copy()
+    dist_future = future_pred_only[["date", "kecamatan", prediction_config["forecast_column"]]].copy()
     dist_future.rename(columns={prediction_config["forecast_column"]: "tons"}, inplace=True)
     dist_future["Keterangan"] = "Prediksi"
 
@@ -621,7 +658,7 @@ with prediksi_tab:
         .encode(
             x=alt.X("date:T", title="Tanggal"),
             y=alt.Y("tons:Q", title="Tonase"),
-            color=alt.Color("kecamatan:N", title="Kecamatan"),
+            color=alt.Color("kecamatan:N", title="Kecamatan", scale=alt.Scale(range=KECAMATAN_COLORS)),
             strokeDash=alt.StrokeDash("Keterangan:N", title="Data"),
             tooltip=[
                 alt.Tooltip("date:T", title="Tanggal", format="%Y-%m-%d"),
@@ -638,7 +675,6 @@ with prediksi_tab:
     )
     st.altair_chart(dist_chart, width="stretch")
 
-    # 3. Tabel Ringkasan
     st.subheader("Ringkasan Prediksi")
     summary_columns = list(dict.fromkeys([
         prediction_config["forecast_column"],
@@ -647,7 +683,7 @@ with prediksi_tab:
         "prediksi_anorganik_ton",
     ]))
     forecast_summary = (
-        future.groupby("kecamatan")[summary_columns]
+        future_pred_only.groupby("kecamatan")[summary_columns]
         .sum()
         .sort_values(prediction_config["forecast_column"], ascending=False)
         .rename(
@@ -661,7 +697,7 @@ with prediksi_tab:
     st.dataframe(forecast_summary.style.format("{:.2f}"), width="stretch")
     st.download_button(
         "Unduh hasil prediksi",
-        future.to_csv(index=False).encode("utf-8"),
+        future_pred_only.to_csv(index=False).encode("utf-8"),
         file_name=f"prediksi_sampah_bogor_{horizon}_hari.csv",
         mime="text/csv",
     )
@@ -681,7 +717,8 @@ with kinerja_tab:
     backtest_long = city_backtest.melt("date", ["aktual", "prediksi"], var_name="seri", value_name="tons")
     backtest_long["seri"] = backtest_long["seri"].map({"aktual": "Aktual", "prediksi": "Prediksi"})
     st.altair_chart(
-        line_chart(backtest_long, "date", "tons", "seri", "Pengujian balik total sampah Kota Bogor", 370),
+        line_chart(backtest_long, "date", "tons", "seri", "Pengujian balik total sampah Kota Bogor", 370,
+                   color_scale=alt.Scale(domain=["Aktual", "Prediksi"], range=[WASTE_COLORS["Total"], "#ec4899"])),
         width="stretch",
     )
 
@@ -698,7 +735,7 @@ with kinerja_tab:
     district_error["selisih_total"] = district_error["prediksi"] - district_error["aktual"]
     error_chart = (
         alt.Chart(district_error.sort_values("galat_absolut"))
-        .mark_bar(color="#7f5af0")
+        .mark_bar(color=WASTE_COLORS["Total"])
         .encode(
             x=alt.X("galat_absolut:Q", title="Rata-rata galat absolut (ton)"),
             y=alt.Y("kecamatan:N", sort=None, title=None),
@@ -721,6 +758,111 @@ with kinerja_tab:
             f"Catatan simulasi: batas galat noise sintetis pada Desember sekitar "
             f"{floor['MAPE (%)']:.2f}% MAPE, bahkan terhadap sinyal bersih tersembunyi."
         )
+
+with detail_tab:
+    st.header("Pencarian & Analisis Harian")
+    st.caption("Pilih spesifik kecamatan, jenis sampah, dan tanggal untuk membedah data secara lebih detail.")
+
+    c1, c2, c3 = st.columns(3)
+    detail_view = c1.selectbox(
+        "Jenis Sampah",
+        list(WASTE_VIEW_OPTIONS),
+        index=0,
+        key="detail_waste_view"
+    )
+    detail_config = WASTE_VIEW_OPTIONS[detail_view]
+
+    detail_districts = c2.multiselect(
+        "Filter Kecamatan",
+        options=selected_districts,
+        default=selected_districts,
+        key="detail_districts"
+    )
+
+    min_date = future_filtered["date"].min().date()
+    max_date = future_filtered["date"].max().date()
+    last_actual_date = filtered["date"].max().date()
+
+    selected_date = c3.date_input(
+        "Pilih Tanggal (Masa lalu / Depan)",
+        value=last_actual_date,
+        min_value=min_date,
+        max_value=max_date
+    )
+
+    sel_ts = pd.to_datetime(selected_date)
+    detail_df = future_filtered[
+        (future_filtered["date"] == sel_ts) &
+        (future_filtered["kecamatan"].isin(detail_districts))
+        ].copy()
+
+    if detail_df.empty:
+        st.warning(
+            "Tidak ada data untuk kombinasi filter yang dipilih (Catatan: 14 hari pertama digunakan sebagai riwayat awal (Lag) model).")
+    else:
+        tipe_data = detail_df["tipe_data"].iloc[0]
+        actual_col = detail_config["history_column"]
+        pred_col = detail_config["forecast_column"]
+        label_nama = detail_config["label"]
+
+        st.subheader(f"Statistik {tipe_data} - {selected_date.strftime('%d %B %Y')}")
+
+        if tipe_data == "Historis":
+            y_true = detail_df[actual_col]
+            y_pred = detail_df[pred_col]
+
+            if len(detail_df) >= 2 and y_true.sum() > 0:
+                metrics = regression_metrics(y_true, y_pred)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("MAE Harian", f"{metrics['MAE']:.2f} ton")
+                m2.metric("RMSE Harian", f"{metrics['RMSE']:.2f} ton")
+                st_lab, st_col = mape_status(metrics['MAPE (%)'])
+                m3.metric("MAPE Harian", f"{metrics['MAPE (%)']:.2f}%", delta=st_lab, delta_color=st_col)
+                m4.metric("R2 Harian", f"{metrics['R2']:.3f}")
+            else:
+                mae = np.abs(y_true.iloc[0] - y_pred.iloc[0])
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Aktual", f"{y_true.iloc[0]:.2f} ton")
+                m2.metric("Prediksi", f"{y_pred.iloc[0]:.2f} ton")
+                m3.metric("Selisih Absolut", f"{mae:.2f} ton")
+                st.info("Pilih lebih dari 1 kecamatan untuk melihat agregat statistik akurasi penuh (R2 Harian).")
+
+            chart_df = detail_df[["kecamatan", actual_col, pred_col]].rename(
+                columns={actual_col: "Aktual", pred_col: "Prediksi"})
+            chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
+
+        else:
+            st.info("Anda memilih hari di masa depan. Hanya menampilkan data prediksi (tanpa metrik evaluasi aktual).")
+            chart_df = detail_df[["kecamatan", pred_col]].rename(columns={pred_col: "Prediksi"})
+            chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
+
+        st.markdown("### Perbandingan Per Kecamatan")
+
+        bar_chart = (
+            alt.Chart(chart_df_melted)
+            .mark_bar()
+            .encode(
+                x=alt.X("kecamatan:N", title="Kecamatan", axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Tonase:Q", title="Tonase (Ton)"),
+                xOffset="Keterangan:N",
+                color=alt.Color("Keterangan:N", title="Legenda", scale=alt.Scale(domain=["Aktual", "Prediksi"],
+                                                                                 range=[detail_config["color"],
+                                                                                        "#a8a29e"])),
+                tooltip=["kecamatan", "Keterangan", alt.Tooltip("Tonase:Q", format=",.2f")]
+            )
+            .properties(height=350)
+            .interactive()
+        )
+        st.altair_chart(bar_chart, use_container_width=True)
+
+        tabel_kolom = ["kecamatan", "kejadian", actual_col, pred_col] if tipe_data == "Historis" else ["kecamatan",
+                                                                                                       "kejadian",
+                                                                                                       pred_col]
+        tabel_df = detail_df[tabel_kolom].rename(
+            columns={actual_col: "Aktual (Ton)", pred_col: "Prediksi (Ton)", "kecamatan": "Kecamatan",
+                     "kejadian": "Event/Kejadian"}
+        )
+        st.dataframe(tabel_df, hide_index=True, width="stretch")
 
 with data_tab:
     st.subheader("Data yang digunakan")
