@@ -461,6 +461,47 @@ def mape_status(value: float) -> tuple[str, str]:
     return "Tinggi", "inverse"
 
 
+2# --- FUNGSI BARU: GENERATOR PENJELASAN EVALUASI DINAMIS ---
+def get_evaluation_description(mae: float, rmse: float, mape: float, r2: float) -> str:
+    desc = []
+
+    # 1. Penjelasan R2 (Seberapa pas prediksi membentuk tren aslinya)
+    if pd.isna(r2):
+        r2_text = "Tidak dapat dihitung (data terlalu sedikit atau variasinya nol)."
+    elif r2 >= 0.75:
+        r2_text = f"**Sangat Baik ({r2:.2f})**. Model sangat akurat mengikuti pola naik-turun aktual harian."
+    elif r2 >= 0.50:
+        r2_text = f"**Cukup Baik ({r2:.2f})**. Model dapat menangkap tren umum, tapi agak meleset di beberapa lonjakan/penurunan."
+    elif r2 >= 0:
+        r2_text = f"**Lemah ({r2:.2f})**. Model kurang pas dalam memprediksi fluktuasi harian data ini."
+    else:
+        r2_text = f"**Buruk ({r2:.2f})**. Prediksi model lebih buruk daripada sekadar menebak rata-rata historis (kemungkinan karena anomali data)."
+
+    desc.append(f"- **R² (Kecocokan Pola Trend):** {r2_text}")
+
+    # 2. Penjelasan MAPE (Tingkat toleransi error dalam bentuk persen)
+    if mape <= 10:
+        mape_text = f"**Sangat Akurat ({mape:.1f}%)**. Error persentase sangat rendah (prediksi nyaris tepat)."
+    elif mape <= 20:
+        mape_text = f"**Dapat Diterima ({mape:.1f}%)**. Akurasi masih berada di batas toleransi operasional yang baik."
+    else:
+        mape_text = f"**Kurang Akurat ({mape:.1f}%)**. Terjadi selisih persentase yang cukup terasa antara prediksi dan aktual."
+
+    desc.append(f"- **MAPE (Rata-rata Persentase Error):** {mape_text}")
+
+    # 3. Penjelasan MAE & RMSE (Mendeteksi apakah ada hari-hari tertentu yang prediksinya meleset parah)
+    outlier_text = ""
+    if rmse > (mae * 1.5):
+        outlier_text = " (Perbedaan cukup jauh antara metrik RMSE dan MAE menandakan kemungkinan ada hari tertentu di mana prediksi meleset **sangat jauh/ekstrem** dari aslinya)."
+    else:
+        outlier_text = " (Nilai RMSE yang dekat dengan MAE menunjukkan bahwa margin melesetnya prediksi cenderung stabil dan **jarang meleset ekstrem**)."
+
+    desc.append(
+        f"- **MAE & RMSE (Volume Error):** Rata-rata setiap tebakan meleset sebesar **{mae:.2f} ton**. Nilai RMSE sebesar **{rmse:.2f} ton**{outlier_text}")
+
+    return "\n".join(desc)
+
+
 st.title("Prediksi Sampah Kota Bogor")
 st.caption("Dashboard ringkas untuk memantau volume, komposisi, peta cakupan, dan prediksi sampah")
 
@@ -710,7 +751,16 @@ with kinerja_tab:
     m3.metric("MAPE pengujian", f"{test_metrics['MAPE (%)']:.2f}%", delta=status_label, delta_color=status_delta)
     m4.metric("R2 pengujian", f"{test_metrics['R2']:.3f}")
 
-    st.caption("Pengujian dilakukan pada data Desember. Model dilatih menggunakan data sampai akhir November.")
+    # ----------------------------------------------------
+    # UPDATE: MENAMPILKAN PENJELASAN EVALUASI DINAMIS
+    # ----------------------------------------------------
+    st.info("💡 **Penjelasan Kinerja Keseluruhan Model:**\n\n" + get_evaluation_description(test_metrics['MAE'],
+                                                                                           test_metrics['RMSE'],
+                                                                                           test_metrics['MAPE (%)'],
+                                                                                           test_metrics['R2']))
+
+    st.caption(
+        "Pengujian dilakukan pada data historis terakhir (Desember). Model dilatih menggunakan data sampai akhir November.")
     city_backtest = backtest.groupby("date", as_index=False).agg(
         aktual=("total_tons", "sum"), prediksi=("prediction", "sum")
     )
@@ -749,15 +799,6 @@ with kinerja_tab:
         .properties(title="Galat prediksi rata-rata per kecamatan", height=320)
     )
     st.altair_chart(error_chart, width="stretch")
-
-    if GROUND_TRUTH_PATH.exists():
-        truth = pd.read_csv(GROUND_TRUTH_PATH, parse_dates=["date"])
-        december = truth[truth.date.between("2025-12-01", "2025-12-31")]
-        floor = regression_metrics(december.total_tons, december.clean_signal_tons)
-        st.info(
-            f"Catatan simulasi: batas galat noise sintetis pada Desember sekitar "
-            f"{floor['MAPE (%)']:.2f}% MAPE, bahkan terhadap sinyal bersih tersembunyi."
-        )
 
 with detail_tab:
     st.header("Pencarian & Analisis Harian")
@@ -803,9 +844,85 @@ with detail_tab:
         tipe_data = detail_df["tipe_data"].iloc[0]
         actual_col = detail_config["history_column"]
         pred_col = detail_config["forecast_column"]
-        label_nama = detail_config["label"]
 
         st.subheader(f"Statistik {tipe_data} - {selected_date.strftime('%d %B %Y')}")
+
+        if detail_view == "Total":
+            if tipe_data == "Historis":
+                df_stack = detail_df[["kecamatan", "organic_tons", "inorganic_tons", "prediksi_organik_ton",
+                                      "prediksi_anorganik_ton"]].copy()
+
+                df_act = df_stack[["kecamatan", "organic_tons", "inorganic_tons"]].melt("kecamatan", var_name="Jenis",
+                                                                                        value_name="Tonase")
+                df_act["Jenis"] = df_act["Jenis"].map({"organic_tons": "Organik", "inorganic_tons": "Anorganik"})
+                df_act["Keterangan"] = "Aktual"
+
+                df_pred = df_stack[["kecamatan", "prediksi_organik_ton", "prediksi_anorganik_ton"]].melt("kecamatan",
+                                                                                                         var_name="Jenis",
+                                                                                                         value_name="Tonase")
+                df_pred["Jenis"] = df_pred["Jenis"].map(
+                    {"prediksi_organik_ton": "Organik", "prediksi_anorganik_ton": "Anorganik"})
+                df_pred["Keterangan"] = "Prediksi"
+
+                chart_df_melted = pd.concat([df_act, df_pred], ignore_index=True)
+            else:
+                df_stack = detail_df[["kecamatan", "prediksi_organik_ton", "prediksi_anorganik_ton"]].copy()
+                df_pred = df_stack.melt("kecamatan", var_name="Jenis", value_name="Tonase")
+                df_pred["Jenis"] = df_pred["Jenis"].map(
+                    {"prediksi_organik_ton": "Organik", "prediksi_anorganik_ton": "Anorganik"})
+                df_pred["Keterangan"] = "Prediksi"
+                chart_df_melted = df_pred
+
+            bar_chart = (
+                alt.Chart(chart_df_melted)
+                .mark_bar()
+                .encode(
+                    x=alt.X("kecamatan:N", title="Kecamatan", axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("Tonase:Q", title="Tonase (Ton)"),
+                    xOffset="Keterangan:N",
+                    color=alt.Color("Jenis:N", title="Jenis Sampah", scale=alt.Scale(domain=["Organik", "Anorganik"],
+                                                                                     range=[WASTE_COLORS["Organik"],
+                                                                                            WASTE_COLORS[
+                                                                                                "Anorganik"]])),
+                    opacity=alt.condition(
+                        alt.datum.Keterangan == 'Prediksi',
+                        alt.value(0.5),  # 50% opacity
+                        alt.value(1.0)
+                    ),
+                    tooltip=["kecamatan", "Keterangan", "Jenis", alt.Tooltip("Tonase:Q", format=",.2f")]
+                )
+                .properties(height=350)
+                .interactive()
+            )
+        else:
+            if tipe_data == "Historis":
+                chart_df = detail_df[["kecamatan", actual_col, pred_col]].rename(
+                    columns={actual_col: "Aktual", pred_col: "Prediksi"})
+                chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
+            else:
+                chart_df = detail_df[["kecamatan", pred_col]].rename(columns={pred_col: "Prediksi"})
+                chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
+
+            bar_chart = (
+                alt.Chart(chart_df_melted)
+                .mark_bar()
+                .encode(
+                    x=alt.X("kecamatan:N", title="Kecamatan", axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("Tonase:Q", title="Tonase (Ton)"),
+                    xOffset="Keterangan:N",
+                    color=alt.Color("Keterangan:N", title="Legenda", scale=alt.Scale(domain=["Aktual", "Prediksi"],
+                                                                                     range=[detail_config["color"],
+                                                                                            detail_config["color"]])),
+                    opacity=alt.condition(
+                        alt.datum.Keterangan == 'Prediksi',
+                        alt.value(0.5),  # 50% Opacity
+                        alt.value(1.0)
+                    ),
+                    tooltip=["kecamatan", "Keterangan", alt.Tooltip("Tonase:Q", format=",.2f")]
+                )
+                .properties(height=350)
+                .interactive()
+            )
 
         if tipe_data == "Historis":
             y_true = detail_df[actual_col]
@@ -819,40 +936,28 @@ with detail_tab:
                 st_lab, st_col = mape_status(metrics['MAPE (%)'])
                 m3.metric("MAPE Harian", f"{metrics['MAPE (%)']:.2f}%", delta=st_lab, delta_color=st_col)
                 m4.metric("R2 Harian", f"{metrics['R2']:.3f}")
+
+                # ----------------------------------------------------
+                # UPDATE: MENAMPILKAN PENJELASAN PADA TANGGAL SPESIFIK
+                # ----------------------------------------------------
+                st.info("💡 **Penjelasan Statistik Harian Ini:**\n\n" + get_evaluation_description(metrics['MAE'],
+                                                                                                  metrics['RMSE'],
+                                                                                                  metrics['MAPE (%)'],
+                                                                                                  metrics['R2']))
+
             else:
                 mae = np.abs(y_true.iloc[0] - y_pred.iloc[0])
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Aktual", f"{y_true.iloc[0]:.2f} ton")
                 m2.metric("Prediksi", f"{y_pred.iloc[0]:.2f} ton")
                 m3.metric("Selisih Absolut", f"{mae:.2f} ton")
-                st.info("Pilih lebih dari 1 kecamatan untuk melihat agregat statistik akurasi penuh (R2 Harian).")
-
-            chart_df = detail_df[["kecamatan", actual_col, pred_col]].rename(
-                columns={actual_col: "Aktual", pred_col: "Prediksi"})
-            chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
+                st.info(
+                    "Pilih lebih dari 1 kecamatan untuk melihat agregat statistik akurasi penuh (seperti R2 dan MAPE rata-rata) di hari ini.")
 
         else:
             st.info("Anda memilih hari di masa depan. Hanya menampilkan data prediksi (tanpa metrik evaluasi aktual).")
-            chart_df = detail_df[["kecamatan", pred_col]].rename(columns={pred_col: "Prediksi"})
-            chart_df_melted = chart_df.melt("kecamatan", var_name="Keterangan", value_name="Tonase")
 
         st.markdown("### Perbandingan Per Kecamatan")
-
-        bar_chart = (
-            alt.Chart(chart_df_melted)
-            .mark_bar()
-            .encode(
-                x=alt.X("kecamatan:N", title="Kecamatan", axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("Tonase:Q", title="Tonase (Ton)"),
-                xOffset="Keterangan:N",
-                color=alt.Color("Keterangan:N", title="Legenda", scale=alt.Scale(domain=["Aktual", "Prediksi"],
-                                                                                 range=[detail_config["color"],
-                                                                                        "#a8a29e"])),
-                tooltip=["kecamatan", "Keterangan", alt.Tooltip("Tonase:Q", format=",.2f")]
-            )
-            .properties(height=350)
-            .interactive()
-        )
         st.altair_chart(bar_chart, use_container_width=True)
 
         tabel_kolom = ["kecamatan", "kejadian", actual_col, pred_col] if tipe_data == "Historis" else ["kecamatan",
